@@ -64,7 +64,7 @@ class McByteMaskConfig:
             or above which mask creation is delayed by ``MaskManager``.
     """
 
-    device: str = "cuda"
+    device: str = "cpu"
 
     sam_checkpoint_path: str | Path | None = None
     sam_model_type: str = "vit_b"
