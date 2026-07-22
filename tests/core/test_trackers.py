@@ -30,7 +30,7 @@ from trackers.core.ocsort.tracker import OCSORTTracker
 from trackers.core.sort.tracker import SORTTracker
 from trackers.utils.iou import BaseIoU
 
-from .shared_ids import ALL_TRACKER_IDS
+from .shared_ids import ALL_TRACKER_IDS, IOU_TRACKER_IDS
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -51,6 +51,14 @@ def _detection(xyxy: tuple[float, float, float, float]) -> sv.Detections:
         xyxy=np.array([xyxy], dtype=np.float32),
         confidence=np.array([0.95], dtype=np.float32),
         class_id=np.array([0], dtype=int),
+    )
+
+
+def _detections(xyxy: list[tuple[float, float, float, float]]) -> sv.Detections:
+    return sv.Detections(
+        xyxy=np.array(xyxy, dtype=np.float32),
+        confidence=np.full(len(xyxy), 0.95, dtype=np.float32),
+        class_id=np.zeros(len(xyxy), dtype=int),
     )
 
 
@@ -119,7 +127,7 @@ def test_tracker_update_empty_does_not_mutate_input(tracker_id: str) -> None:
     assert result is not dets, "update() must return a new sv.Detections instance"
 
 
-@pytest.mark.parametrize("tracker_id", ALL_TRACKER_IDS)
+@pytest.mark.parametrize("tracker_id", IOU_TRACKER_IDS)
 def test_tracker_uses_configured_iou_variant(tracker_id: str) -> None:
     """Trackers should use the configured IoU implementation for matching."""
     tracking_iou = _TrackingIoU()
@@ -143,6 +151,7 @@ def test_no_confidence_detections_can_spawn_confirmed_tracks(tracker_id: str) ->
     raise AssertionError(f"{tracker_id} did not confirm any track for confidence=None detections")
 
 
+@pytest.mark.parametrize("tracker_id", ALL_TRACKER_IDS)
 @pytest.mark.parametrize(
     "xyxy_boxes",
     [
@@ -165,16 +174,15 @@ def test_no_confidence_detections_can_spawn_confirmed_tracks(tracker_id: str) ->
     ],
     ids=["single_box", "two_boxes", "three_boxes_non_overlapping"],
 )
-def test_bytetrack_no_confidence_matches_explicit_ones_confidence(xyxy_boxes: np.ndarray) -> None:
-    """ByteTrack treats confidence=None the same as all-ones across multi-box batches.
+def test_no_confidence_matches_explicit_ones_confidence(tracker_id: str, xyxy_boxes: np.ndarray) -> None:
+    """Every tracker treats confidence=None the same as all-ones across multi-box batches.
 
-    The batched scenarios exercise the high/low split machinery in
-    `ByteTrackTracker.update()` that single-box equivalence cannot trigger; a
-    regression that mis-buckets `confidence=None` in a multi-detection batch
-    would still pass single-box equality but would diverge here.
+    Multi-detection batches exercise confidence bucketing in trackers that split
+    high/low detections; a regression that mis-buckets ``confidence=None`` would
+    still pass single-box equality but diverge here.
     """
-    no_confidence_tracker = ByteTrackTracker(minimum_consecutive_frames=1)
-    explicit_confidence_tracker = ByteTrackTracker(minimum_consecutive_frames=1)
+    no_confidence_tracker = _instantiate(tracker_id, minimum_consecutive_frames=1)
+    explicit_confidence_tracker = _instantiate(tracker_id, minimum_consecutive_frames=1)
     class_ids = np.zeros(len(xyxy_boxes), dtype=int)
     detection_without_confidence = sv.Detections(xyxy=xyxy_boxes.copy(), class_id=class_ids.copy())
     detection_with_ones_confidence = sv.Detections(
@@ -242,6 +250,124 @@ def test_bytetrack_no_confidence_spawns_tracks_below_activation_threshold() -> N
     assert np.all(no_confidence_result.tracker_id >= 0), "confidence=None should spawn confirmed tracks for every box"
     assert np.all(low_confidence_result.tracker_id < 0), (
         "explicit low confidence below activation threshold should NOT spawn tracks"
+    )
+
+
+def test_bytetrack_returns_unmatched_detection_between_thresholds() -> None:
+    """A detection whose confidence sits between high_conf_det_threshold and
+    track_activation_threshold must still be returned (with tracker_id -1) when
+    it matches no track, not silently dropped."""
+    tracker = ByteTrackTracker(
+        high_conf_det_threshold=0.6,
+        track_activation_threshold=0.7,
+    )
+    detections = sv.Detections(
+        xyxy=np.array([[10.0, 10.0, 50.0, 50.0], [100.0, 100.0, 140.0, 140.0], [200.0, 200.0, 240.0, 240.0]]),
+        confidence=np.array([0.50, 0.65, 0.80]),  # low / mid (in the gap) / high
+    )
+
+    result = tracker.update(detections)
+
+    assert len(result) == 3, "every detection must be returned, including the mid-confidence one"
+    # compare with a tolerance: confidence may be stored as float32
+    np.testing.assert_allclose(np.sort(result.confidence), [0.50, 0.65, 0.80], atol=1e-6)
+    assert result.tracker_id is not None
+    assert np.all(result.tracker_id == -1), "no detection matches a track on the first frame"
+
+
+def test_bytetrack_all_detections_in_gap() -> None:
+    """All detections in [high_conf_det_threshold, track_activation_threshold) return tracker_id=-1.
+
+    When every detection falls in the confidence gap, Stage 2 loop is empty and
+    _spawn_new_tracks processes them all but spawns no tracks.
+    """
+    tracker = ByteTrackTracker(
+        high_conf_det_threshold=0.5,
+        track_activation_threshold=0.8,
+    )
+    detections = sv.Detections(
+        xyxy=np.array([[0.0, 0.0, 10.0, 10.0], [20.0, 20.0, 30.0, 30.0]]),
+        confidence=np.array([0.55, 0.70]),  # both in gap
+    )
+
+    result = tracker.update(detections)
+
+    assert len(result) == 2
+    assert result.tracker_id is not None
+    assert np.all(result.tracker_id == -1)
+    assert len(tracker.tracks) == 0, "no tracks spawned when confidence below activation threshold"
+
+
+def test_bytetrack_mid_gap_detection_returned_across_frames() -> None:
+    """Mid-gap detection (tracker_id=-1) continues to appear in output on frame 2+.
+
+    A regression where a mid-gap detection stops being returned on subsequent
+    frames would not be caught by the single-frame test.
+    """
+    tracker = ByteTrackTracker(
+        high_conf_det_threshold=0.6,
+        track_activation_threshold=0.7,
+    )
+    mid_gap_det = sv.Detections(
+        xyxy=np.array([[10.0, 10.0, 50.0, 50.0]]),
+        confidence=np.array([0.65]),  # in gap
+    )
+
+    result_f1 = tracker.update(mid_gap_det)
+    result_f2 = tracker.update(mid_gap_det)
+
+    assert len(result_f1) == 1
+    assert result_f1.tracker_id is not None
+    assert np.all(result_f1.tracker_id == -1)
+    assert len(result_f2) == 1
+    assert result_f2.tracker_id is not None
+    assert np.all(result_f2.tracker_id == -1)
+
+
+def test_bytetrack_mid_gap_detection_matched_in_stage1() -> None:
+    """Mid-gap detection overlapping a confirmed track is matched in Stage 1.
+
+    A detection with confidence in [high_conf_det_threshold, track_activation_threshold)
+    qualifies for Stage 1 matching; if it overlaps an existing confirmed track it should
+    receive the track's positive tracker_id, not -1.
+
+    Three-frame sequence: frame 1 spawns the track (tracker_id=-1), frame 2 matches and
+    promotes it to a positive ID (minimum_consecutive_frames=1), frame 3 presents a
+    mid-gap detection that is matched in Stage 1 and receives the same positive ID.
+    """
+    tracker = ByteTrackTracker(
+        high_conf_det_threshold=0.6,
+        track_activation_threshold=0.7,
+        minimum_consecutive_frames=1,
+    )
+    box = np.array([[10.0, 10.0, 50.0, 50.0]])
+
+    # Frame 1: high-conf detection spawns a tentative track (tracker_id=-1).
+    frame1 = sv.Detections(xyxy=box, confidence=np.array([0.80]))
+    result1 = tracker.update(frame1)
+    assert len(result1) == 1
+    assert result1.tracker_id is not None
+    assert result1.tracker_id[0] == -1, "newly spawned track is tentative on frame 1"
+
+    # Frame 2: same high-conf detection matches the track — now 1 consecutive update.
+    # minimum_consecutive_frames=1 → track is promoted to a positive ID.
+    frame2 = sv.Detections(xyxy=box, confidence=np.array([0.80]))
+    result2 = tracker.update(frame2)
+    assert len(result2) == 1
+    assert result2.tracker_id is not None
+    confirmed_id = result2.tracker_id[0]
+    assert confirmed_id >= 0, "track promoted to positive ID after minimum_consecutive_frames=1 matches"
+
+    # Frame 3: mid-gap confidence at the same position.
+    # conf=0.65 >= high_conf_det_threshold=0.6 → qualifies for Stage 1 matching.
+    # Overlaps the confirmed track → matched → receives the track's positive ID.
+    frame3 = sv.Detections(xyxy=box, confidence=np.array([0.65]))
+    result3 = tracker.update(frame3)
+
+    assert len(result3) == 1
+    assert result3.tracker_id is not None
+    assert result3.tracker_id[0] == confirmed_id, (
+        "mid-gap det matched to confirmed track must receive the track's positive ID, not -1"
     )
 
 
@@ -330,6 +456,21 @@ def _run_until_confirmed(
     raise AssertionError("expected at least one confirmed track after warmup")
 
 
+def _run_until_n_confirmed(
+    tracker: BaseTracker,
+    detection: sv.Detections,
+    n: int,
+    max_steps: int = 8,
+) -> list[int]:
+    """Advance tracker until at least n confirmed tracks exist; return their IDs."""
+    for _ in range(max_steps):
+        tracker.update(detection)
+        ids = [int(t.tracker_id) for t in tracker.tracks if t.tracker_id >= 0]
+        if len(ids) >= n:
+            return ids
+    raise AssertionError(f"expected {n} confirmed tracks after {max_steps} steps")
+
+
 @pytest.mark.parametrize("tracker_id", ALL_TRACKER_IDS)
 def test_reset_clears_tracks_and_restarts_ids(tracker_id: str) -> None:
     """reset() must clear state and restart tracker IDs from zero."""
@@ -349,6 +490,50 @@ def test_reset_clears_tracks_and_restarts_ids(tracker_id: str) -> None:
     assert min(confirmed_ids) == 0
 
 
+@pytest.mark.parametrize("tracker_id", ALL_TRACKER_IDS)
+def test_tracker_instances_do_not_share_id_allocators(tracker_id: str) -> None:
+    """Resetting one tracker instance must not make another instance reuse a live ID."""
+    tracker_a = _instantiate(tracker_id, minimum_consecutive_frames=1)
+    tracker_b = _instantiate(tracker_id, minimum_consecutive_frames=1)
+    tracker_a.reset()
+
+    first_det = _detection((100.0, 100.0, 200.0, 200.0))
+    two_dets = _detections(
+        [
+            (100.0, 100.0, 200.0, 200.0),
+            (400.0, 400.0, 500.0, 500.0),
+        ]
+    )
+
+    _run_until_confirmed(tracker_a, first_det)
+    a_ids = [int(t.tracker_id) for t in tracker_a.tracks if t.tracker_id >= 0]
+    assert a_ids == [0]
+
+    tracker_b.reset()
+
+    # tracker_b must restart from 0, independent of tracker_a's counter
+    _run_until_confirmed(tracker_b, _detection((200.0, 200.0, 300.0, 300.0)))
+    b_ids = [int(t.tracker_id) for t in tracker_b.tracks if t.tracker_id >= 0]
+    assert b_ids == [0], f"tracker_b should restart from 0 independent of tracker_a, got {b_ids}"
+
+    # tracker_a must continue allocating unique IDs after tracker_b.reset()
+    a_ids = _run_until_n_confirmed(tracker_a, two_dets, n=2)
+    assert len(a_ids) == len(set(a_ids)), f"tracker_a IDs not unique after tracker_b.reset(): {a_ids}"
+
+
+def test_cbiou_monotonic_ids_within_single_session() -> None:
+    """CBIoUTracker must increment IDs monotonically within one session."""
+    tracker = _instantiate("cbiou", minimum_consecutive_frames=1)
+    two_dets = _detections(
+        [
+            (100.0, 100.0, 200.0, 200.0),
+            (400.0, 400.0, 500.0, 500.0),
+        ]
+    )
+    ids = _run_until_n_confirmed(tracker, two_dets, n=2)
+    assert sorted(ids) == [0, 1], f"expected IDs [0, 1] for first two cbiou tracks, got {ids}"
+
+
 # ==========================================================================
 # 3. Track lifecycle / pruning
 # ==========================================================================
@@ -359,7 +544,7 @@ def test_reset_clears_tracks_and_restarts_ids(tracker_id: str) -> None:
 # automatically without any explicit call from the tracker.
 #
 # These tests pin the contract for every concrete tracker:
-# 1. A confirmed track is pruned after ``lost_track_buffer + N`` empty frames.
+# 1. A confirmed track is pruned once the scaled ``lost_track_buffer`` is exceeded.
 # 2. ``time_since_update`` actually advances when frames are missed.
 # 3. A confirmed track survives a short occlusion.
 # 4. Tracks spawned after frame 1 start unconfirmed.
@@ -452,6 +637,118 @@ def test_track_survives_short_occlusion(tracker_id: str) -> None:
 
     assert len(tracker.tracks) == 1
     assert tracker.tracks[0].tracker_id == confirmed_id, "confirmed track must survive a short gap"
+
+
+@pytest.mark.parametrize("tracker_id", ALL_TRACKER_IDS)
+def test_track_survives_exact_lost_buffer_boundary(tracker_id: str) -> None:
+    """lost_track_buffer=N keeps a confirmed track alive for exactly N missed frames."""
+    tracker = _instantiate(
+        tracker_id,
+        lost_track_buffer=3,
+        frame_rate=30,
+        minimum_consecutive_frames=1,
+    )
+    bbox = (100.0, 100.0, 200.0, 200.0)
+
+    _run_until_confirmed(tracker, _detection(bbox))
+
+    for _ in range(tracker.maximum_frames_without_update):
+        tracker.update(sv.Detections.empty())
+
+    assert len(tracker.tracks) == 1, "track must survive through the full lost buffer"
+    assert tracker.tracks[0].time_since_update == tracker.maximum_frames_without_update
+
+    tracker.update(sv.Detections.empty())
+
+    assert len(tracker.tracks) == 0, "track must expire after the lost buffer is exceeded"
+
+
+@pytest.mark.parametrize("tracker_id", ALL_TRACKER_IDS)
+def test_low_frame_rate_lost_buffer_rounds_up_to_one_frame(tracker_id: str) -> None:
+    """Low-FPS scaling must not floor a positive lost_track_buffer to zero."""
+    tracker = _instantiate(
+        tracker_id,
+        lost_track_buffer=1,
+        frame_rate=10,
+        minimum_consecutive_frames=1,
+    )
+    bbox = (100.0, 100.0, 200.0, 200.0)
+
+    assert tracker.maximum_frames_without_update == 1
+
+    _run_until_confirmed(tracker, _detection(bbox))
+    tracker.update(sv.Detections.empty())
+
+    assert len(tracker.tracks) == 1, "one requested missed frame must be preserved"
+    assert tracker.tracks[0].time_since_update == 1
+
+    tracker.update(sv.Detections.empty())
+
+    assert len(tracker.tracks) == 0, "track expires once the one-frame buffer is exceeded"
+
+
+@pytest.mark.parametrize("tracker_id", ALL_TRACKER_IDS)
+def test_zero_lost_buffer_expires_on_first_missed_frame(tracker_id: str) -> None:
+    """lost_track_buffer=0 is an explicit no-grace-period configuration."""
+    tracker = _instantiate(
+        tracker_id,
+        lost_track_buffer=0,
+        frame_rate=30,
+        minimum_consecutive_frames=1,
+    )
+    bbox = (100.0, 100.0, 200.0, 200.0)
+
+    assert tracker.maximum_frames_without_update == 0
+
+    _run_until_confirmed(tracker, _detection(bbox))
+    assert len(tracker.tracks) == 1
+
+    tracker.update(sv.Detections.empty())
+
+    assert len(tracker.tracks) == 0, "zero buffer must prune on the first missed frame"
+
+
+@pytest.mark.parametrize(
+    "lost_track_buffer,frame_rate,expected",
+    [
+        pytest.param(30, 30, 30, id="baseline_30fps"),
+        pytest.param(30, 60, 60, id="double_fps"),
+        pytest.param(30, 120, 120, id="quad_fps"),
+        pytest.param(3, 15, 2, id="ceil_over_int_noninteger"),
+        pytest.param(5, 10, 2, id="ceil_fraction"),
+        pytest.param(1, 10, 1, id="low_fps_min_one"),
+        pytest.param(0, 30, 0, id="zero_buffer_passthrough"),
+    ],
+)
+def test_compute_maximum_frames_without_update_scaling(
+    lost_track_buffer: int,
+    frame_rate: float,
+    expected: int,
+) -> None:
+    """_compute_maximum_frames_without_update uses ceil; non-integer intermediates round up."""
+    result = BaseTracker._compute_maximum_frames_without_update(lost_track_buffer, frame_rate)
+    assert result == expected
+
+
+@pytest.mark.parametrize("tracker_id", ALL_TRACKER_IDS)
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        pytest.param({"lost_track_buffer": -1}, id="negative_buffer"),
+        pytest.param({"frame_rate": 0}, id="zero_frame_rate"),
+        pytest.param({"frame_rate": -30}, id="negative_frame_rate"),
+        pytest.param({"frame_rate": float("inf")}, id="inf_frame_rate"),
+        pytest.param({"frame_rate": float("nan")}, id="nan_frame_rate"),
+        pytest.param({"frame_rate": float("-inf")}, id="neg_inf_frame_rate"),
+    ],
+)
+def test_lost_buffer_configuration_rejects_invalid_values(
+    tracker_id: str,
+    kwargs: dict[str, int | float],
+) -> None:
+    """Non-negative lost_track_buffer and positive finite frame_rate are required."""
+    with pytest.raises(ValueError):
+        _instantiate(tracker_id, **kwargs)
 
 
 # ==========================================================================
@@ -578,3 +875,12 @@ def test_bytetrack_consecutive_counter_resets_on_miss() -> None:
     tracker.update(_detection(bbox))
     assert tracker.tracks[0].number_of_successful_consecutive_updates == 1
     assert tracker.tracks[0].tracker_id == -1
+
+
+def test_sort_trackers_property_emits_future_warning() -> None:
+    """Accessing deprecated .trackers must emit FutureWarning with correct message."""
+    tracker = SORTTracker(minimum_consecutive_frames=1)
+    with pytest.warns(FutureWarning, match=r"deprecated since v2\.5"):
+        result = tracker.trackers
+    assert result is tracker.tracks
+    assert isinstance(type(tracker).__dict__["trackers"], property)
